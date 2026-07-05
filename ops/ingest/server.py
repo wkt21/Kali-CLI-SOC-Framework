@@ -1,3 +1,110 @@
+# Ingest Server — Auth Model & Trust Boundary
+
+`ops/ingest/server.py` accepts endpoint/agent events at `POST /ingest`. Two
+layers of auth apply, in order:
+
+1. **API key** — `X-API-Key` header must match the `INGEST_API_KEY`
+   environment variable, compared in constant time. An unset or empty
+   `INGEST_API_KEY` is treated as "not configured" and rejects every
+   request, rather than risking an empty key matching an empty header.
+
+2. **mTLS (optional, `REQUIRE_MTLS=true`)** — the request must carry:
+
+   ```
+   X-SSL-Client-Verify: SUCCESS
+   X-SSL-Client-S-DN: CN=<client-cn>,OU=...,O=...
+   ```
+
+   The CN is extracted from the subject DN and stored on each ingested
+   event as `_client_identity`.
+
+## ⚠️ Read this before enabling `REQUIRE_MTLS`
+
+`X-SSL-Client-Verify` and `X-SSL-Client-S-DN` are **ordinary HTTP headers**.
+This server does not terminate TLS or verify client certificates itself —
+it trusts that something in front of it already did, and set these headers
+from that real verification.
+
+That trust is only valid if **both** of the following hold:
+
+- A reverse proxy (e.g. nginx) terminates client-cert TLS and sets these
+  headers unconditionally on every request it forwards:
+
+  ```nginx
+  proxy_set_header X-SSL-Client-Verify $ssl_client_verify;
+  proxy_set_header X-SSL-Client-S-DN    $ssl_client_s_dn;
+  ```
+
+  `proxy_set_header` always overwrites — it does not merge with or forward
+  whatever the original client sent — so this is safe *as configured*.
+
+- This process is **never reachable except through that proxy**. Bind it to
+  `127.0.0.1` or a Unix socket, and firewall the port from anything else.
+
+If either condition doesn't hold — most notably, if you're running the
+"Local Setup" instructions from the top-level README (`uvicorn` directly
+with `--ssl-certfile`/`--ssl-keyfile`, no nginx in front) — there is nothing
+actually verifying client certificates, and anyone who can reach the port
+can set `X-SSL-Client-Verify: SUCCESS` themselves and walk straight through
+`REQUIRE_MTLS`.
+
+### Defense in depth: `TRUSTED_PROXY_HOSTS`
+
+An optional, **off by default**, source-address allowlist:
+
+```bash
+export TRUSTED_PROXY_HOSTS="10.0.0.5,10.0.0.6"
+```
+
+When set, a request claiming `REQUIRE_MTLS` success is also rejected
+(`403`) unless it arrived from one of these hosts. This narrows the blast
+radius if the network topology assumption above is ever violated, but it is
+**not a substitute** for the two conditions above — it's the second layer,
+not the first.
+
+### Recommendation
+
+Treat `TRUSTED_PROXY_HOSTS` as effectively mandatory whenever
+`REQUIRE_MTLS=true` is used outside a fully trusted lab network, until the
+"uvicorn directly, no proxy" deployment path is either removed or
+explicitly documented as mTLS-incompatible.
+
+## Other hardening in this implementation
+
+- **Missing `return` statement (bug, now fixed)** — the version in the repo
+  falls through its `try/except` on the happy path with no `return`,
+  so FastAPI serializes the response as `null` instead of
+  `{"received": N}`. This breaks `test_ingest_success_no_mtls`'s
+  `data["received"] == 1` assertion outright. Fixed by adding
+  `return {"received": len(payload)}`.
+- **Read-modify-write race in `_atomic_append_json_list`** — the
+  temp-file-then-`rename()` pattern is atomic for the write itself, but
+  two concurrent requests could both read the same `existing` list before
+  either writes, and the second writer's rename silently discards the
+  first writer's event. Fixed with an `flock()`-based advisory lock on a
+  sidecar `endpoint.json.lock` file, held for the whole
+  read-modify-write, so concurrent agents don't lose events under load.
+- **CN sanitization** (already present, worth calling out) — the extracted
+  CN is passed through `re.sub(r"[^A-Za-z0-9_.-]", "_", cn)` before being
+  stored, so a crafted certificate subject can't inject unexpected
+  characters into stored event records. Good defensive habit, kept as-is.
+- **`TRUSTED_PROXY_HOSTS`** (added, opt-in, off by default) — same
+  defense-in-depth mechanism described above: when set, a request claiming
+  `REQUIRE_MTLS` success is also rejected unless it arrived from an
+  allow-listed source host.
+
+## Testing note
+
+This was validated by hand, line by line, against the actual
+`ops/ingest/server.py` and `tests/ops/ingest/test_ingest.py` (header
+casing, `CN=` extraction from the subject DN, `ENDPOINT_FILE` override via
+`tmp_path`, env var timing via `monkeypatch`) — that review is what caught
+the missing `return` statement above. It was **not executed**: the sandbox
+this was written in has no network access to install `fastapi`/`httpx`/
+`pytest`. Run the test suite locally before merging.
+
+
+
 #!/usr/bin/env python3
 """
 FastAPI ingestion server for endpoint agent events.
